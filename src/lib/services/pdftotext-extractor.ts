@@ -3,8 +3,8 @@
  * Uses pdf-parse library - works on Vercel, Lambda, any Node environment
  */
 
-// @ts-ignore - pdf-parse doesn't have proper types
-import pdfParse from 'pdf-parse';
+// @ts-ignore - pdf-parse is a CommonJS module
+const pdfParse = require('pdf-parse');
 
 export interface PDFTextResult {
     text: string;
