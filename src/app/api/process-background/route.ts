@@ -57,9 +57,8 @@ export async function POST(request: NextRequest) {
         if (!processingResult.success || processingResult.transactions.length === 0) {
             await updateConversionStatus(adminSupabase, conversionId, 'failed');
             await updateConversionResults(adminSupabase, conversionId, {
-                processing_method: processingResult.method,
-                extraction_confidence: 0,
-                reconciliation_status: 'failed',
+                page_count: 0,
+                is_reconciled: false,
                 error_message: processingResult.errors?.join(', ') || 'No transactions extracted',
             });
 
@@ -147,14 +146,12 @@ export async function POST(request: NextRequest) {
         // Save transactions
         await createTransactions(adminSupabase, transactionsWithIds);
 
-        // Update conversion results
+        // Update conversion results (only use columns that exist in database)
         await updateConversionResults(adminSupabase, conversionId, {
-            processing_method: processingResult.method,
-            extraction_confidence: processingResult.confidence * 100,
             opening_balance: processingResult.openingBalance,
             closing_balance: processingResult.closingBalance,
             calculated_closing: processingResult.calculatedClosing,
-            reconciliation_status: processingResult.isReconciled ? 'matched' : 'discrepancy',
+            is_reconciled: processingResult.isReconciled || false,
             reconciliation_difference: processingResult.reconciliationDifference,
             page_count: processingResult.pageCount,
             bank_detected: processingResult.bankDetected,
