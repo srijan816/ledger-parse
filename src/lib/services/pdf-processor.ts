@@ -4,8 +4,11 @@
  */
 
 import { detectPDFType } from './pdf-type-detector';
-import { extractFromNativePDF } from './native-pdf-extractor';
 import { extractWithGemini } from './gemini-extractor';
+
+// NOTE: JS native extraction has been removed.
+// All native PDF extraction now goes through Python worker (pdfplumber) for accuracy.
+// This prevents the "Balance Trap" - mistaking Balance for Amount.
 
 // Python worker URL (configure based on deployment)
 const PYTHON_WORKER_URL = process.env.PYTHON_WORKER_URL || 'http://localhost:8000';
@@ -171,67 +174,83 @@ export async function processDocument(
 
 
 async function processNativePDF(buffer: Buffer, current: ProcessingResult): Promise<ProcessingResult> {
-    // Try Python worker first - it has column-aware extraction using pdfplumber
-    // This solves the "Balance Trap" by properly distinguishing Amount vs Balance columns
-    try {
-        const formData = new FormData();
-        const blob = new Blob([new Uint8Array(buffer)], { type: 'application/pdf' });
-        formData.append('file', blob, 'document.pdf');
+    /**
+     * Native PDF extraction using Python worker ONLY.
+     * 
+     * IMPORTANT: We no longer have a JS fallback.
+     * The JS fallback was removed because it used flawed "last number" logic
+     * that confused Balance with Amount, causing data corruption.
+     * 
+     * If Python worker is unavailable, we fail cleanly rather than produce wrong data.
+     * Consistency > Availability of bad data.
+     */
+    const formData = new FormData();
+    const blob = new Blob([new Uint8Array(buffer)], { type: 'application/pdf' });
+    formData.append('file', blob, 'document.pdf');
 
+    try {
         const response = await fetch(`${PYTHON_WORKER_URL}/extract/native`, {
             method: 'POST',
             body: formData,
+            signal: AbortSignal.timeout(60000), // 60s timeout
         });
 
-        if (response.ok) {
-            const result = await response.json();
-            if (result.success && result.transactions?.length > 0) {
-                console.log('Using Python worker column-aware extraction');
-                return {
-                    ...current,
-                    method: 'native',
-                    bankDetected: null, // Python worker doesn't detect bank yet
-                    transactions: result.transactions.map((t: any) => ({
-                        date: t.date,
-                        description: t.description,
-                        amount: t.amount,
-                        type: t.type,
-                        balance: t.balance,
-                        confidence: t.confidence,
-                        bbox: t.bbox,
-                        rawText: t.raw_text,
-                    })),
-                    openingBalance: result.opening_balance,
-                    closingBalance: result.closing_balance,
-                    pageCount: result.page_count,
-                    confidence: result.confidence,
-                    cost: 0,
-                    errors: result.errors || [],
-                    warnings: [],
-                };
-            }
+        if (!response.ok) {
+            throw new Error(`Python worker returned ${response.status}: ${response.statusText}`);
         }
+
+        const result = await response.json();
+
+        if (!result.success) {
+            throw new Error(result.errors?.join(', ') || 'Python extraction failed');
+        }
+
+        if (!result.transactions || result.transactions.length === 0) {
+            throw new Error('No transactions extracted from PDF');
+        }
+
+        console.log(`Python worker extracted ${result.transactions.length} transactions`);
+
+        return {
+            ...current,
+            method: 'native',
+            bankDetected: null,
+            transactions: result.transactions.map((t: any) => ({
+                date: t.date,
+                description: t.description,
+                amount: t.amount,
+                type: t.type,
+                balance: t.balance,
+                confidence: t.confidence,
+                bbox: t.bbox,
+                rawText: t.raw_text,
+            })),
+            openingBalance: result.opening_balance,
+            closingBalance: result.closing_balance,
+            pageCount: result.page_count,
+            confidence: result.confidence,
+            cost: 0,
+            errors: result.errors || [],
+            warnings: [],
+        };
+
     } catch (error) {
-        console.log('Python worker unavailable, falling back to pure JS extraction');
+        const errorMessage = error instanceof Error ? error.message : 'Unknown error';
+        console.error('Python worker extraction failed:', errorMessage);
+
+        // FAIL CLEANLY - do not fall back to bad JS extraction
+        return {
+            ...current,
+            success: false,
+            method: 'native',
+            transactions: [],
+            errors: [
+                `Native extraction failed: ${errorMessage}`,
+                'Python worker is required for accurate extraction. Please ensure it is running.',
+            ],
+            warnings: [],
+        };
     }
-
-    // Fallback to pure JavaScript extraction (pdf-parse)
-    // This works everywhere but uses simpler "last number" logic
-    const extraction = await extractFromNativePDF(buffer);
-
-    return {
-        ...current,
-        method: 'native',
-        bankDetected: extraction.bankDetected,
-        transactions: extraction.transactions,
-        openingBalance: extraction.openingBalance,
-        closingBalance: extraction.closingBalance,
-        pageCount: extraction.pageCount,
-        confidence: extraction.confidence,
-        cost: 0,
-        errors: extraction.errors,
-        warnings: ['Using pure JS fallback - column detection may be limited'],
-    };
 }
 
 

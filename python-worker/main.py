@@ -182,7 +182,10 @@ async def extract_native_pdf(file: UploadFile = File(...)):
             full_text = '\n'.join(all_text)
             opening_balance, closing_balance = extract_balances_from_text(full_text)
             
-            avg_confidence = 0.85 if transactions else 0.0
+            # MATH VALIDATION: Verify Previous + Credits - Debits = New Balance
+            transactions = validate_transactions_math(transactions, opening_balance)
+            
+            avg_confidence = sum(t.confidence for t in transactions) / len(transactions) if transactions else 0.0
             
             return ExtractionResult(
                 success=True,
@@ -209,6 +212,58 @@ async def extract_native_pdf(file: UploadFile = File(...)):
         )
     finally:
         os.unlink(tmp_path)
+
+
+def validate_transactions_math(
+    transactions: List[Transaction], 
+    opening_balance: Optional[float]
+) -> List[Transaction]:
+    """
+    MATH VALIDATION: Verify that each transaction's balance follows the formula:
+    Previous Balance + Credit - Debit = New Balance
+    
+    If math doesn't work, flag the transaction with lower confidence (needs_review).
+    This helps identify rows where Amount and Balance might be swapped.
+    """
+    if not transactions or opening_balance is None:
+        return transactions
+    
+    validated = []
+    prev_balance = opening_balance
+    
+    for tx in transactions:
+        new_tx = tx  # Will replace if needed
+        
+        if tx.balance is not None:
+            # Calculate expected balance
+            amount = tx.amount if tx.amount else 0
+            if tx.type == 'credit':
+                expected_balance = prev_balance + amount
+            else:  # debit
+                expected_balance = prev_balance - amount
+            
+            # Check if math works (within 0.01 tolerance for rounding)
+            diff = abs(tx.balance - expected_balance)
+            
+            if diff > 0.01:
+                # Math doesn't work - might have swapped Amount/Balance
+                # Flag with lower confidence
+                new_tx = Transaction(
+                    date=tx.date,
+                    description=tx.description,
+                    amount=tx.amount,
+                    type=tx.type,
+                    balance=tx.balance,
+                    confidence=0.5,  # Reduce confidence - needs review
+                    bbox=tx.bbox,
+                    raw_text=tx.raw_text + f" [MATH_CHECK_FAILED: expected {expected_balance:.2f}, got {tx.balance:.2f}]"
+                )
+            
+            prev_balance = tx.balance  # Use actual balance for next row
+        
+        validated.append(new_tx)
+    
+    return validated
 
 
 def detect_column_anchors(words: list) -> dict:
