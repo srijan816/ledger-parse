@@ -171,6 +171,52 @@ export async function processDocument(
 
 
 async function processNativePDF(buffer: Buffer, current: ProcessingResult): Promise<ProcessingResult> {
+    // Try Python worker first - it has column-aware extraction using pdfplumber
+    // This solves the "Balance Trap" by properly distinguishing Amount vs Balance columns
+    try {
+        const formData = new FormData();
+        const blob = new Blob([new Uint8Array(buffer)], { type: 'application/pdf' });
+        formData.append('file', blob, 'document.pdf');
+
+        const response = await fetch(`${PYTHON_WORKER_URL}/extract/native`, {
+            method: 'POST',
+            body: formData,
+        });
+
+        if (response.ok) {
+            const result = await response.json();
+            if (result.success && result.transactions?.length > 0) {
+                console.log('Using Python worker column-aware extraction');
+                return {
+                    ...current,
+                    method: 'native',
+                    bankDetected: null, // Python worker doesn't detect bank yet
+                    transactions: result.transactions.map((t: any) => ({
+                        date: t.date,
+                        description: t.description,
+                        amount: t.amount,
+                        type: t.type,
+                        balance: t.balance,
+                        confidence: t.confidence,
+                        bbox: t.bbox,
+                        rawText: t.raw_text,
+                    })),
+                    openingBalance: result.opening_balance,
+                    closingBalance: result.closing_balance,
+                    pageCount: result.page_count,
+                    confidence: result.confidence,
+                    cost: 0,
+                    errors: result.errors || [],
+                    warnings: [],
+                };
+            }
+        }
+    } catch (error) {
+        console.log('Python worker unavailable, falling back to pure JS extraction');
+    }
+
+    // Fallback to pure JavaScript extraction (pdf-parse)
+    // This works everywhere but uses simpler "last number" logic
     const extraction = await extractFromNativePDF(buffer);
 
     return {
@@ -184,7 +230,7 @@ async function processNativePDF(buffer: Buffer, current: ProcessingResult): Prom
         confidence: extraction.confidence,
         cost: 0,
         errors: extraction.errors,
-        warnings: [],
+        warnings: ['Using pure JS fallback - column detection may be limited'],
     };
 }
 

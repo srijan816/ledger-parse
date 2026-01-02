@@ -121,6 +121,290 @@ async def pdf_to_images(file: UploadFile = File(...)):
             os.unlink(tmp_path)
 
 
+@app.post("/extract/native", response_model=ExtractionResult)
+async def extract_native_pdf(file: UploadFile = File(...)):
+    """
+    Extract text from NATIVE (text-based) PDFs using pdfplumber.
+    Uses X/Y coordinates for COLUMN-AWARE extraction to solve the "Balance Trap".
+    This properly distinguishes Amount vs Balance columns.
+    """
+    import re
+    try:
+        import pdfplumber
+    except ImportError:
+        raise HTTPException(status_code=501, detail="pdfplumber not installed")
+    
+    errors = []
+    transactions = []
+    
+    with tempfile.NamedTemporaryFile(delete=False, suffix='.pdf') as tmp:
+        content = await file.read()
+        tmp.write(content)
+        tmp_path = tmp.name
+    
+    try:
+        with pdfplumber.open(tmp_path) as pdf:
+            page_count = len(pdf.pages)
+            all_text = []
+            
+            for page_idx, page in enumerate(pdf.pages):
+                # Get all words with their X/Y coordinates
+                words = page.extract_words(
+                    keep_blank_chars=True,
+                    x_tolerance=3,
+                    y_tolerance=3
+                )
+                
+                if not words:
+                    continue
+                
+                # Get full text for balance extraction
+                page_text = page.extract_text() or ''
+                all_text.append(page_text)
+                
+                # Detect column structure from header row
+                column_anchors = detect_column_anchors(words)
+                
+                # Group words by line (Y coordinate)
+                lines = group_words_by_line(words, tolerance=5)
+                
+                # Parse each line using column anchors
+                for line_y, line_words in sorted(lines.items()):
+                    transaction = parse_line_with_columns(
+                        line_words, 
+                        column_anchors, 
+                        page_idx + 1
+                    )
+                    if transaction:
+                        transactions.append(transaction)
+            
+            # Extract balances from full text
+            full_text = '\n'.join(all_text)
+            opening_balance, closing_balance = extract_balances_from_text(full_text)
+            
+            avg_confidence = 0.85 if transactions else 0.0
+            
+            return ExtractionResult(
+                success=True,
+                method='native',
+                transactions=transactions,
+                opening_balance=opening_balance,
+                closing_balance=closing_balance,
+                page_count=page_count,
+                confidence=avg_confidence,
+                errors=errors
+            )
+    
+    except Exception as e:
+        errors.append(str(e))
+        return ExtractionResult(
+            success=False,
+            method='native',
+            transactions=[],
+            opening_balance=None,
+            closing_balance=None,
+            page_count=0,
+            confidence=0,
+            errors=errors
+        )
+    finally:
+        os.unlink(tmp_path)
+
+
+def detect_column_anchors(words: list) -> dict:
+    """
+    Detect column positions by looking for header keywords.
+    Returns dict with column types and their X positions.
+    """
+    anchors = {
+        'date': None,
+        'description': None,
+        'debit': None,
+        'credit': None,
+        'amount': None,
+        'balance': None,
+    }
+    
+    # Look for header keywords in first ~50 words
+    header_words = words[:100] if len(words) > 100 else words
+    
+    for word in header_words:
+        text = word['text'].lower().strip()
+        x_center = (word['x0'] + word['x1']) / 2
+        
+        if 'date' in text:
+            anchors['date'] = x_center
+        elif 'description' in text or 'detail' in text or 'memo' in text:
+            anchors['description'] = x_center
+        elif 'debit' in text or 'withdrawal' in text or 'dr' == text:
+            anchors['debit'] = x_center
+        elif 'credit' in text or 'deposit' in text or 'cr' == text:
+            anchors['credit'] = x_center
+        elif 'amount' in text and 'balance' not in text:
+            anchors['amount'] = x_center
+        elif 'balance' in text:
+            anchors['balance'] = x_center
+    
+    return anchors
+
+
+def group_words_by_line(words: list, tolerance: int = 5) -> dict:
+    """Group words into lines based on Y coordinate."""
+    lines = {}
+    
+    for word in words:
+        y = round(word['top'] / tolerance) * tolerance
+        if y not in lines:
+            lines[y] = []
+        lines[y].append(word)
+    
+    # Sort words in each line by X coordinate
+    for y in lines:
+        lines[y] = sorted(lines[y], key=lambda w: w['x0'])
+    
+    return lines
+
+
+def parse_line_with_columns(
+    line_words: list, 
+    column_anchors: dict, 
+    page_number: int
+) -> Optional[Transaction]:
+    """
+    Parse a line of words into a transaction using column anchors.
+    This is the key function that solves the "Balance Trap".
+    """
+    import re
+    
+    if not line_words:
+        return None
+    
+    # Reconstruct line text
+    line_text = ' '.join(w['text'] for w in line_words)
+    
+    # Skip header/footer lines
+    skip_patterns = [
+        r'page\s*\d+',
+        r'statement\s*(date|period)',
+        r'account\s*number',
+        r'customer\s*service',
+        r'^date\s+description',
+        r'www\.',
+    ]
+    for pattern in skip_patterns:
+        if re.search(pattern, line_text, re.IGNORECASE):
+            return None
+    
+    # Extract date, description, amount, balance based on position
+    date = None
+    description_parts = []
+    amount = None
+    balance = None
+    tx_type = 'unknown'
+    
+    # Find all numeric values on the line with their positions
+    numeric_values = []
+    for word in line_words:
+        text = word['text'].strip()
+        # Check if this word is a number (with optional $, parentheses, etc.)
+        num_match = re.match(r'^[\$]?\s*[\(\-]?[\d,]+\.?\d*[\)]?$', text.replace(',', ''))
+        if num_match:
+            try:
+                # Parse the number
+                clean = text.replace('$', '').replace(',', '').strip()
+                is_negative = '(' in text or '-' in text
+                value = float(clean.replace('(', '').replace(')', '').replace('-', ''))
+                if is_negative:
+                    value = -value
+                
+                numeric_values.append({
+                    'value': value,
+                    'x': (word['x0'] + word['x1']) / 2,
+                    'text': text
+                })
+            except ValueError:
+                pass
+    
+    # Look for date at the start
+    for word in line_words[:3]:  # Check first 3 words for date
+        text = word['text'].strip()
+        date_match = re.match(r'\d{1,2}[/-]\d{1,2}(?:[/-]\d{2,4})?', text)
+        if date_match:
+            date = text
+            break
+        # Also check for "01 Jan" or "Jan 01" format
+        date_match2 = re.match(r'(\d{1,2}\s+\w{3}|\w{3}\s+\d{1,2})', text)
+        if date_match2:
+            date = text
+            break
+    
+    if not date:
+        return None  # Most transactions have dates
+    
+    # Assign numeric values to columns based on position
+    if len(numeric_values) >= 2 and column_anchors.get('balance'):
+        balance_x = column_anchors['balance']
+        
+        # Sort values by X position
+        sorted_values = sorted(numeric_values, key=lambda v: v['x'])
+        
+        # The value closest to balance column is the balance
+        for i, val in enumerate(sorted_values):
+            if abs(val['x'] - balance_x) < 50:  # Within 50px of balance column
+                balance = val['value']
+                # The other value(s) are amount
+                for j, other_val in enumerate(sorted_values):
+                    if j != i:
+                        amount = other_val['value']
+                        tx_type = 'debit' if amount < 0 else 'credit'
+                break
+    
+    elif len(numeric_values) >= 2:
+        # Fallback: without clear column anchors
+        # Assume rightmost is balance, second-rightmost is amount
+        sorted_values = sorted(numeric_values, key=lambda v: v['x'])
+        if len(sorted_values) >= 2:
+            balance = sorted_values[-1]['value']
+            amount = sorted_values[-2]['value']
+            tx_type = 'debit' if amount < 0 else 'credit'
+    
+    elif len(numeric_values) == 1:
+        # Single number - assume it's the amount
+        amount = numeric_values[0]['value']
+        tx_type = 'debit' if amount < 0 else 'credit'
+    
+    if amount is None:
+        return None
+    
+    # Build description from non-numeric, non-date words
+    for word in line_words:
+        text = word['text'].strip()
+        if text == date:
+            continue
+        if any(nv['text'] == text for nv in numeric_values):
+            continue
+        description_parts.append(text)
+    
+    description = ' '.join(description_parts).strip()[:200]
+    
+    return Transaction(
+        date=date,
+        description=description,
+        amount=abs(amount),
+        type=tx_type,
+        balance=balance,
+        confidence=0.85,
+        bbox={
+            'x1': min(w['x0'] for w in line_words),
+            'y1': min(w['top'] for w in line_words),
+            'x2': max(w['x1'] for w in line_words),
+            'y2': max(w['bottom'] for w in line_words),
+            'page': page_number
+        },
+        raw_text=line_text
+    )
+
+
 @app.post("/preprocess", response_model=PreprocessResult)
 async def preprocess_pdf(file: UploadFile = File(...)):
     """
