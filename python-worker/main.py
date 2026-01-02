@@ -91,6 +91,59 @@ class PreprocessResult(BaseModel):
 async def health_check():
     return {"status": "healthy", "gmft_available": GMFT_AVAILABLE}
 
+
+@app.post("/detect-type")
+async def detect_pdf_type(file: UploadFile = File(...)):
+    """
+    Detect if a PDF is native (text-based) or scanned (image-based).
+    Uses pdfplumber to extract text and measure density.
+    """
+    try:
+        import pdfplumber
+    except ImportError:
+        return {"type": "native", "confidence": 0.5, "error": "pdfplumber not installed"}
+    
+    with tempfile.NamedTemporaryFile(delete=False, suffix='.pdf') as tmp:
+        content = await file.read()
+        tmp.write(content)
+        tmp_path = tmp.name
+    
+    try:
+        with pdfplumber.open(tmp_path) as pdf:
+            page_count = len(pdf.pages)
+            total_chars = 0
+            
+            # Sample first few pages for efficiency
+            for page in pdf.pages[:min(3, page_count)]:
+                text = page.extract_text() or ''
+                total_chars += len(text)
+            
+            avg_chars_per_page = total_chars / min(3, page_count) if page_count > 0 else 0
+            
+            # Native PDFs typically have 500+ chars per page
+            has_text = avg_chars_per_page > 500
+            
+            return {
+                "type": "native" if has_text else "scanned",
+                "scan_quality": None if has_text else "good",
+                "page_count": page_count,
+                "has_text": has_text,
+                "text_density": avg_chars_per_page,
+                "confidence": 0.9 if has_text else 0.8,
+            }
+    
+    except Exception as e:
+        return {
+            "type": "native",
+            "page_count": 1,
+            "has_text": False,
+            "text_density": 0,
+            "confidence": 0.5,
+            "error": str(e)
+        }
+    finally:
+        os.unlink(tmp_path)
+
 @app.post("/pdf-to-images")
 async def pdf_to_images(file: UploadFile = File(...)):
     """

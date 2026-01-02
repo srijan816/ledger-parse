@@ -1,90 +1,19 @@
 /**
- * Gemini 3 Flash Extractor for Bank Statements
+ * Gemini Extractor for Bank Statements
  * Uses Google AI File API for memory-safe large PDF handling
  * Handles multi-account consolidated statements with advanced reasoning
+ * 
+ * IMPORTANT: Uses @google/generative-ai for File API (GoogleAIFileManager)
  */
 
-import { GoogleGenAI } from '@google/genai';
+import { GoogleGenerativeAI } from '@google/generative-ai';
+import { GoogleAIFileManager } from '@google/generative-ai/server';
 import { writeFile, unlink } from 'fs/promises';
 import { tmpdir } from 'os';
 import { join } from 'path';
 import { randomUUID } from 'crypto';
 
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
-
-// Define SchemaType locally
-const SchemaType = {
-    STRING: "STRING",
-    NUMBER: "NUMBER",
-    INTEGER: "INTEGER",
-    BOOLEAN: "BOOLEAN",
-    ARRAY: "ARRAY",
-    OBJECT: "OBJECT"
-} as const;
-
-// Transaction schema
-const transactionSchema = {
-    type: SchemaType.OBJECT,
-    properties: {
-        date: { type: SchemaType.STRING, description: "Transaction date in YYYY-MM-DD format" },
-        description: { type: SchemaType.STRING, description: "Full transaction description (combine multi-line if needed)" },
-        amount: { type: SchemaType.NUMBER, description: "Absolute transaction amount as a number" },
-        type: { type: SchemaType.STRING, enum: ["debit", "credit"], description: "debit for withdrawals/payments, credit for deposits/income" },
-        balance: { type: SchemaType.NUMBER, nullable: true, description: "Running balance after this transaction" },
-        category: { type: SchemaType.STRING, nullable: true, description: "Transaction category if identifiable" },
-    },
-    required: ["date", "description", "amount", "type"],
-};
-
-// Account schema for multi-account support
-const accountSchema = {
-    type: SchemaType.OBJECT,
-    properties: {
-        accountNumber: { type: SchemaType.STRING, nullable: true, description: "Account number (masked or full)" },
-        accountType: { type: SchemaType.STRING, nullable: true, description: "e.g. Savings, Checking, Current, Credit Card" },
-        currency: { type: SchemaType.STRING, nullable: true, description: "Currency code (HKD, USD, etc.)" },
-        openingBalance: { type: SchemaType.NUMBER, nullable: true },
-        closingBalance: { type: SchemaType.NUMBER, nullable: true },
-        transactions: {
-            type: SchemaType.ARRAY,
-            items: transactionSchema,
-            description: "All transactions for this specific account"
-        },
-    },
-    required: ["transactions"],
-};
-
-// Full extraction schema with multi-account support
-const extractionSchema = {
-    type: SchemaType.OBJECT,
-    properties: {
-        bankName: { type: SchemaType.STRING, nullable: true },
-        statementDate: { type: SchemaType.STRING, nullable: true, description: "Statement date in YYYY-MM-DD" },
-        statementPeriod: {
-            type: SchemaType.OBJECT,
-            properties: {
-                start: { type: SchemaType.STRING, nullable: true },
-                end: { type: SchemaType.STRING, nullable: true },
-            },
-            nullable: true,
-        },
-        customerName: { type: SchemaType.STRING, nullable: true },
-        isMultiAccount: { type: SchemaType.BOOLEAN, description: "True if this is a consolidated statement with multiple accounts" },
-        accounts: {
-            type: SchemaType.ARRAY,
-            items: accountSchema,
-            description: "Array of accounts found in the statement"
-        },
-        openingBalance: { type: SchemaType.NUMBER, nullable: true, description: "Overall opening balance (sum if multi-account)" },
-        closingBalance: { type: SchemaType.NUMBER, nullable: true, description: "Overall closing balance (sum if multi-account)" },
-        transactions: {
-            type: SchemaType.ARRAY,
-            items: transactionSchema,
-            description: "ALL transactions from all accounts combined"
-        },
-    },
-    required: ["transactions"],
-};
 
 interface GeminiExtractionResult {
     success: boolean;
@@ -129,11 +58,14 @@ const EXTRACTION_PROMPT = `You are analyzing a bank statement PDF. Extract ALL f
    - Foreign currency transactions
 
 ## Output Requirements
-- Return valid JSON matching the provided schema
-- Include ALL transactions - do not skip any
-- The "transactions" array at root level should contain ALL transactions from ALL accounts combined
-- The "accounts" array should contain per-account breakdowns
-- Set "isMultiAccount" to true if multiple accounts are detected
+Return a JSON object with:
+- bankName: string (detected bank name)
+- statementPeriod: { start: "YYYY-MM-DD", end: "YYYY-MM-DD" }
+- isMultiAccount: boolean
+- accounts: array of account objects with their own transactions
+- openingBalance: number (overall/primary)
+- closingBalance: number (overall/primary)
+- transactions: array of ALL transactions combined
 
 Be thorough and precise. Missing transactions will cause reconciliation failures.`;
 
@@ -142,116 +74,88 @@ export async function extractWithGemini(pdfBuffer: Buffer): Promise<GeminiExtrac
         return { success: false, error: "Missing GEMINI_API_KEY" };
     }
 
-    // Write buffer to temp file for File API upload
     const tempFile = join(tmpdir(), `gemini-${randomUUID()}.pdf`);
 
     try {
-        const ai = new GoogleGenAI({ apiKey: GEMINI_API_KEY });
-
-        // Check file size - use File API for large files, inline for small
+        // Check file size
         const fileSizeMB = pdfBuffer.length / (1024 * 1024);
         console.log(`PDF size: ${fileSizeMB.toFixed(2)} MB`);
 
-        let contents: any[];
+        // Initialize clients
+        const genAI = new GoogleGenerativeAI(GEMINI_API_KEY);
+        const model = genAI.getGenerativeModel({ model: 'gemini-2.0-flash' });
+
+        let parts: any[];
 
         if (fileSizeMB > 4) {
-            // LARGE FILE: Use File API to avoid memory issues
-            console.log('Using Gemini File API for large PDF...');
+            // LARGE FILE: Use File Manager to upload directly to Google
+            console.log('Using Google AI File Manager for large PDF...');
 
+            // Write buffer to temp file
             await writeFile(tempFile, pdfBuffer);
 
-            // Upload file to Google AI
-            const uploadResult = await ai.files.upload({
-                file: tempFile,
-                config: {
-                    mimeType: "application/pdf",
-                    displayName: "Bank Statement",
-                }
+            // Initialize file manager
+            const fileManager = new GoogleAIFileManager(GEMINI_API_KEY);
+
+            // Upload file
+            const uploadResult = await fileManager.uploadFile(tempFile, {
+                mimeType: "application/pdf",
+                displayName: "Bank Statement",
             });
 
-            if (!uploadResult?.uri) {
-                throw new Error('File upload failed - no URI returned');
-            }
+            console.log(`File uploaded: ${uploadResult.file.uri}`);
 
-            console.log(`File uploaded: ${uploadResult.uri}`);
-
-            // Wait for file to be processed
-            let file = uploadResult;
+            // Wait for file to be ready (ACTIVE state)
+            let file = await fileManager.getFile(uploadResult.file.name);
             while (file.state === 'PROCESSING') {
-                await new Promise(resolve => setTimeout(resolve, 1000));
-                const fileStatus = await ai.files.get({ name: file.name! });
-                file = fileStatus;
+                console.log('Waiting for file processing...');
+                await new Promise(resolve => setTimeout(resolve, 2000));
+                file = await fileManager.getFile(uploadResult.file.name);
             }
 
             if (file.state === 'FAILED') {
                 throw new Error('File processing failed on Google servers');
             }
 
-            contents = [{
-                role: 'user',
-                parts: [
-                    { text: EXTRACTION_PROMPT },
-                    {
-                        fileData: {
-                            mimeType: file.mimeType || "application/pdf",
-                            fileUri: file.uri!
-                        }
+            // Use file URI instead of inline data
+            parts = [
+                { text: EXTRACTION_PROMPT },
+                {
+                    fileData: {
+                        mimeType: file.mimeType,
+                        fileUri: file.uri
                     }
-                ],
-            }];
+                }
+            ];
         } else {
             // SMALL FILE: Use inline base64 (faster for small files)
             console.log('Using inline base64 for small PDF...');
             const base64Data = pdfBuffer.toString('base64');
 
-            contents = [{
-                role: 'user',
-                parts: [
-                    { text: EXTRACTION_PROMPT },
-                    {
-                        inlineData: {
-                            mimeType: "application/pdf",
-                            data: base64Data
-                        }
+            parts = [
+                { text: EXTRACTION_PROMPT },
+                {
+                    inlineData: {
+                        mimeType: "application/pdf",
+                        data: base64Data
                     }
-                ],
-            }];
+                }
+            ];
         }
 
-        const model = 'gemini-2.5-flash-preview-05-20';
-
-        // Enable HIGH thinking level for better analysis
-        const config = {
-            thinkingConfig: {
-                thinkingBudget: 10000,
+        console.log('Calling Gemini...');
+        const result = await model.generateContent({
+            contents: [{ role: 'user', parts }],
+            generationConfig: {
+                responseMimeType: 'application/json',
             },
-            responseMimeType: 'application/json',
-            responseSchema: extractionSchema,
-        };
-
-        console.log('Calling Gemini with thinking budget...');
-        const result = await ai.models.generateContent({
-            model,
-            contents,
-            config
         });
 
-        // Handle different possible response structures
-        let responseText: string | undefined;
-
-        if (result?.response?.text) {
-            responseText = typeof result.response.text === 'function'
-                ? result.response.text()
-                : result.response.text;
-        } else if (result?.text) {
-            responseText = typeof result.text === 'function' ? result.text() : result.text;
-        } else if (result?.candidates?.[0]?.content?.parts?.[0]?.text) {
-            responseText = result.candidates[0].content.parts[0].text;
-        }
+        const response = result.response;
+        const responseText = response.text();
 
         if (!responseText) {
-            console.error('Gemini API Response:', JSON.stringify(result, null, 2));
-            throw new Error("Empty or unexpected response structure from Gemini");
+            throw new Error("Empty response from Gemini");
         }
 
         const data = JSON.parse(responseText);
@@ -269,7 +173,7 @@ export async function extractWithGemini(pdfBuffer: Buffer): Promise<GeminiExtrac
         return {
             success: true,
             data,
-            usage: result?.response?.usageMetadata || result?.usageMetadata
+            usage: response.usageMetadata
         };
 
     } catch (error: any) {
@@ -283,7 +187,7 @@ export async function extractWithGemini(pdfBuffer: Buffer): Promise<GeminiExtrac
         try {
             await unlink(tempFile);
         } catch {
-            // Ignore cleanup errors
+            // Ignore cleanup errors - file may not exist if we used inline
         }
     }
 }
