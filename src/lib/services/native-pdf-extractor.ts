@@ -3,7 +3,7 @@
  * Uses pdftotext CLI (poppler) for reliable text extraction
  */
 
-import { extractTextFromPDF } from './pdftotext-extractor';
+import { extractTextFromPDFAsync } from './pdftotext-extractor';
 
 interface RawTransaction {
     date: string | null;
@@ -61,8 +61,8 @@ export async function extractFromNativePDF(buffer: Buffer | Uint8Array): Promise
     const errors: string[] = [];
 
     try {
-        // Use pdftotext CLI for reliable text extraction
-        const result = extractTextFromPDF(Buffer.from(buffer));
+        // Use ASYNC pdftotext CLI for reliable text extraction (non-blocking!)
+        const result = await extractTextFromPDFAsync(Buffer.from(buffer));
 
         if (!result.success) {
             throw new Error(result.error || 'PDF text extraction failed');

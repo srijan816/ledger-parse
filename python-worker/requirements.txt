@@ -11,6 +11,9 @@ numpy==1.26.3
 torch==2.1.2
 torchvision==0.16.2
 
+# OCRmyPDF for preprocessing scanned PDFs
+ocrmypdf==16.0.0
+
 # GMFT for table detection (optional but recommended)
 gmft==0.2.0
 pypdfium2==4.25.0

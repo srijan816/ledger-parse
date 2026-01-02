@@ -100,20 +100,71 @@ export async function POST(request: NextRequest) {
 
             // Save Transactions
             // Map the new engine's transaction format to DB schema
-            // Helper to validate dates
+            // Helper to validate dates - STRICT UTC PARSING to avoid timezone shifts
             const parseValidDate = (dateStr: string | null): string | null => {
                 if (!dateStr) return null;
 
-                // Attempt to parse and validate the date
-                const d = new Date(dateStr);
-                if (isNaN(d.getTime())) return null;
+                // Try to parse as YYYY-MM-DD (ISO format) directly without timezone conversion
+                const isoMatch = dateStr.match(/^(\d{4})-(\d{2})-(\d{2})/);
+                if (isoMatch) {
+                    const [, year, month, day] = isoMatch;
+                    return `${year}-${month}-${day}`;
+                }
 
-                // Check reasonable year range (1900-2100)
-                const year = d.getFullYear();
-                if (year < 1900 || year > 2100) return null;
+                // Try common date formats and convert to YYYY-MM-DD string directly
+                // This avoids Date object timezone issues
+                const formats = [
+                    // DD Mon YYYY or D Mon YYYY
+                    {
+                        regex: /^(\d{1,2})\s+(\w{3})\s+(\d{4})/, handler: (m: RegExpMatchArray) => {
+                            const months: Record<string, string> = { jan: '01', feb: '02', mar: '03', apr: '04', may: '05', jun: '06', jul: '07', aug: '08', sep: '09', oct: '10', nov: '11', dec: '12' };
+                            const mon = months[m[2].toLowerCase()];
+                            return mon ? `${m[3]}-${mon}-${m[1].padStart(2, '0')}` : null;
+                        }
+                    },
+                    // Mon DD, YYYY
+                    {
+                        regex: /^(\w{3})\s+(\d{1,2}),?\s+(\d{4})/, handler: (m: RegExpMatchArray) => {
+                            const months: Record<string, string> = { jan: '01', feb: '02', mar: '03', apr: '04', may: '05', jun: '06', jul: '07', aug: '08', sep: '09', oct: '10', nov: '11', dec: '12' };
+                            const mon = months[m[1].toLowerCase()];
+                            return mon ? `${m[3]}-${mon}-${m[2].padStart(2, '0')}` : null;
+                        }
+                    },
+                    // MM/DD/YYYY
+                    {
+                        regex: /^(\d{1,2})\/(\d{1,2})\/(\d{4})/, handler: (m: RegExpMatchArray) =>
+                            `${m[3]}-${m[1].padStart(2, '0')}-${m[2].padStart(2, '0')}`
+                    },
+                    // MM-DD-YYYY
+                    {
+                        regex: /^(\d{1,2})-(\d{1,2})-(\d{4})/, handler: (m: RegExpMatchArray) =>
+                            `${m[3]}-${m[1].padStart(2, '0')}-${m[2].padStart(2, '0')}`
+                    },
+                ];
 
-                // Return in ISO format for database
-                return d.toISOString().split('T')[0];
+                for (const { regex, handler } of formats) {
+                    const match = dateStr.match(regex);
+                    if (match) {
+                        const result = handler(match);
+                        if (result) return result;
+                    }
+                }
+
+                // Fallback: try Date parsing but force to UTC string
+                try {
+                    // Append Z to force UTC interpretation
+                    const d = new Date(dateStr + (dateStr.includes('T') ? '' : 'T00:00:00Z'));
+                    if (!isNaN(d.getTime())) {
+                        const year = d.getUTCFullYear();
+                        if (year >= 1900 && year <= 2100) {
+                            return `${year}-${String(d.getUTCMonth() + 1).padStart(2, '0')}-${String(d.getUTCDate()).padStart(2, '0')}`;
+                        }
+                    }
+                } catch {
+                    // Ignore date parsing errors
+                }
+
+                return null;
             };
 
             const transactionsWithIds = processingResult.transactions.map((tx, index) => {
