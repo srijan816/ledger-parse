@@ -219,47 +219,123 @@ def validate_transactions_math(
     opening_balance: Optional[float]
 ) -> List[Transaction]:
     """
-    MATH VALIDATION: Verify that each transaction's balance follows the formula:
-    Previous Balance + Credit - Debit = New Balance
+    MATH VALIDATION with COLUMN SWAP DETECTION:
     
-    If math doesn't work, flag the transaction with lower confidence (needs_review).
-    This helps identify rows where Amount and Balance might be swapped.
+    1. First pass: Check if math works (Previous + Credits - Debits = New Balance)
+    2. If >50% of rows fail: Try swapping Amount and Balance columns
+    3. If swap works better: Return swapped transactions
+    4. Otherwise: Flag failed rows with lower confidence
     """
     if not transactions or opening_balance is None:
         return transactions
     
+    # First pass - check math with original data
+    original_pass_rate = _calculate_math_pass_rate(transactions, opening_balance)
+    
+    # If most rows pass, we're good
+    if original_pass_rate >= 0.5:
+        return _apply_math_validation(transactions, opening_balance)
+    
+    # Most rows fail - try swapping Amount and Balance
+    print(f"Math validation: Only {original_pass_rate*100:.0f}% pass. Trying column swap...")
+    
+    swapped_transactions = _swap_amount_balance(transactions)
+    swapped_pass_rate = _calculate_math_pass_rate(swapped_transactions, opening_balance)
+    
+    print(f"After column swap: {swapped_pass_rate*100:.0f}% pass")
+    
+    if swapped_pass_rate > original_pass_rate:
+        # Swap worked better! Use swapped data
+        print("Column swap improved results - using swapped data")
+        return _apply_math_validation(swapped_transactions, opening_balance)
+    else:
+        # Original was better or same - keep original but flag failures
+        return _apply_math_validation(transactions, opening_balance)
+
+
+def _calculate_math_pass_rate(
+    transactions: List[Transaction], 
+    opening_balance: float
+) -> float:
+    """Calculate what percentage of transactions pass math validation."""
+    if not transactions:
+        return 0.0
+    
+    passed = 0
+    prev_balance = opening_balance
+    
+    for tx in transactions:
+        if tx.balance is not None:
+            amount = tx.amount if tx.amount else 0
+            if tx.type == 'credit':
+                expected = prev_balance + amount
+            else:
+                expected = prev_balance - amount
+            
+            if abs(tx.balance - expected) <= 0.01:
+                passed += 1
+            
+            prev_balance = tx.balance
+    
+    rows_with_balance = sum(1 for tx in transactions if tx.balance is not None)
+    return passed / rows_with_balance if rows_with_balance > 0 else 0.0
+
+
+def _swap_amount_balance(transactions: List[Transaction]) -> List[Transaction]:
+    """Swap the Amount and Balance columns for all transactions."""
+    swapped = []
+    for tx in transactions:
+        if tx.balance is not None and tx.amount is not None:
+            # Swap amount and balance
+            swapped.append(Transaction(
+                date=tx.date,
+                description=tx.description,
+                amount=abs(tx.balance),  # Old balance becomes amount
+                type=tx.type,
+                balance=tx.amount,  # Old amount becomes balance
+                confidence=tx.confidence,
+                bbox=tx.bbox,
+                raw_text=tx.raw_text + " [COLUMNS_SWAPPED]"
+            ))
+        else:
+            swapped.append(tx)
+    return swapped
+
+
+def _apply_math_validation(
+    transactions: List[Transaction], 
+    opening_balance: float
+) -> List[Transaction]:
+    """Apply math validation and flag rows that fail."""
     validated = []
     prev_balance = opening_balance
     
     for tx in transactions:
-        new_tx = tx  # Will replace if needed
+        new_tx = tx
         
         if tx.balance is not None:
-            # Calculate expected balance
             amount = tx.amount if tx.amount else 0
             if tx.type == 'credit':
-                expected_balance = prev_balance + amount
-            else:  # debit
-                expected_balance = prev_balance - amount
+                expected = prev_balance + amount
+            else:
+                expected = prev_balance - amount
             
-            # Check if math works (within 0.01 tolerance for rounding)
-            diff = abs(tx.balance - expected_balance)
+            diff = abs(tx.balance - expected)
             
             if diff > 0.01:
-                # Math doesn't work - might have swapped Amount/Balance
-                # Flag with lower confidence
+                # Math doesn't work - flag with lower confidence
                 new_tx = Transaction(
                     date=tx.date,
                     description=tx.description,
                     amount=tx.amount,
                     type=tx.type,
                     balance=tx.balance,
-                    confidence=0.5,  # Reduce confidence - needs review
+                    confidence=0.5,
                     bbox=tx.bbox,
-                    raw_text=tx.raw_text + f" [MATH_CHECK_FAILED: expected {expected_balance:.2f}, got {tx.balance:.2f}]"
+                    raw_text=tx.raw_text + f" [MATH_CHECK_FAILED: expected {expected:.2f}]"
                 )
             
-            prev_balance = tx.balance  # Use actual balance for next row
+            prev_balance = tx.balance
         
         validated.append(new_tx)
     

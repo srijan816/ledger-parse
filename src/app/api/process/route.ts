@@ -81,16 +81,24 @@ export async function POST(request: NextRequest) {
         // Mark as processing IMMEDIATELY
         await updateConversionStatus(adminSupabase, conversionId, 'processing')
 
-        // ASYNC: Trigger background processing (fire and forget)
-        // This prevents serverless timeout - the background endpoint handles the work
+        // ASYNC: Trigger background processing
+        // Use waitUntil to keep the serverless process alive until fetch is dispatched
+        // Without this, Vercel/Lambda will kill the process immediately after response
         const baseUrl = request.nextUrl.origin
 
-        // Use non-blocking fetch - we don't await this
-        fetch(`${baseUrl}/api/process-background`, {
+        // Import waitUntil dynamically to avoid issues in non-Vercel environments
+        let waitUntilFn: ((promise: Promise<any>) => void) | null = null;
+        try {
+            const vercelFunctions = await import('@vercel/functions');
+            waitUntilFn = vercelFunctions.waitUntil;
+        } catch {
+            // Not on Vercel - use standard promise handling
+        }
+
+        const backgroundPromise = fetch(`${baseUrl}/api/process-background`, {
             method: 'POST',
             headers: {
                 'Content-Type': 'application/json',
-                // Pass auth for RLS
                 'x-supabase-auth': process.env.SUPABASE_SERVICE_ROLE_KEY || '',
             },
             body: JSON.stringify({
@@ -100,8 +108,12 @@ export async function POST(request: NextRequest) {
             }),
         }).catch(err => {
             console.error('Failed to trigger background processing:', err);
-            // Don't fail the request - the status will show the error
         });
+
+        // Use waitUntil if available (Vercel), otherwise fire-and-forget
+        if (waitUntilFn) {
+            waitUntilFn(backgroundPromise);
+        }
 
         // Return IMMEDIATELY with 202 Accepted
         return NextResponse.json({

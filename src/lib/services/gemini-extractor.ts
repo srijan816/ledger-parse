@@ -1,10 +1,14 @@
 /**
  * Gemini 3 Flash Extractor for Bank Statements
+ * Uses Google AI File API for memory-safe large PDF handling
  * Handles multi-account consolidated statements with advanced reasoning
  */
 
 import { GoogleGenAI } from '@google/genai';
-import { Buffer } from 'buffer';
+import { writeFile, unlink } from 'fs/promises';
+import { tmpdir } from 'os';
+import { join } from 'path';
+import { randomUUID } from 'crypto';
 
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
 
@@ -69,34 +73,31 @@ const extractionSchema = {
         accounts: {
             type: SchemaType.ARRAY,
             items: accountSchema,
-            description: "List of accounts. Single-account statements will have one item."
+            description: "Array of accounts found in the statement"
         },
-        // Legacy fields for backward compatibility (populated from first/primary account)
-        openingBalance: { type: SchemaType.NUMBER, nullable: true },
-        closingBalance: { type: SchemaType.NUMBER, nullable: true },
+        openingBalance: { type: SchemaType.NUMBER, nullable: true, description: "Overall opening balance (sum if multi-account)" },
+        closingBalance: { type: SchemaType.NUMBER, nullable: true, description: "Overall closing balance (sum if multi-account)" },
         transactions: {
             type: SchemaType.ARRAY,
             items: transactionSchema,
-            description: "All transactions combined (for backward compatibility)"
+            description: "ALL transactions from all accounts combined"
         },
     },
-    required: ["accounts", "transactions"],
+    required: ["transactions"],
 };
 
-export interface GeminiExtractionResult {
+interface GeminiExtractionResult {
     success: boolean;
     data?: any;
     error?: string;
     usage?: any;
 }
 
-const EXTRACTION_PROMPT = `You are an expert financial document analyst. Analyze this bank statement PDF with careful attention to detail.
+const EXTRACTION_PROMPT = `You are analyzing a bank statement PDF. Extract ALL financial transactions with high precision.
 
-## Your Task
-Extract ALL transaction details and account information from this bank statement into structured JSON.
+## CRITICAL INSTRUCTIONS
 
-## Critical Analysis Steps
-1. **Identify if this is a CONSOLIDATED/MULTI-ACCOUNT statement** - Look for:
+1. **Identify Account Structure**: Look for signs of consolidated/multi-account statements:
    - Multiple account numbers or account sections
    - Different account types (Savings, Current, Credit Card, etc.)
    - Different currencies
@@ -141,16 +142,69 @@ export async function extractWithGemini(pdfBuffer: Buffer): Promise<GeminiExtrac
         return { success: false, error: "Missing GEMINI_API_KEY" };
     }
 
+    // Write buffer to temp file for File API upload
+    const tempFile = join(tmpdir(), `gemini-${randomUUID()}.pdf`);
+
     try {
         const ai = new GoogleGenAI({ apiKey: GEMINI_API_KEY });
 
-        // Convert buffer to base64
-        const base64Data = pdfBuffer.toString('base64');
+        // Check file size - use File API for large files, inline for small
+        const fileSizeMB = pdfBuffer.length / (1024 * 1024);
+        console.log(`PDF size: ${fileSizeMB.toFixed(2)} MB`);
 
-        const model = 'gemini-3-flash-preview';
+        let contents: any[];
 
-        const contents = [
-            {
+        if (fileSizeMB > 4) {
+            // LARGE FILE: Use File API to avoid memory issues
+            console.log('Using Gemini File API for large PDF...');
+
+            await writeFile(tempFile, pdfBuffer);
+
+            // Upload file to Google AI
+            const uploadResult = await ai.files.upload({
+                file: tempFile,
+                config: {
+                    mimeType: "application/pdf",
+                    displayName: "Bank Statement",
+                }
+            });
+
+            if (!uploadResult?.uri) {
+                throw new Error('File upload failed - no URI returned');
+            }
+
+            console.log(`File uploaded: ${uploadResult.uri}`);
+
+            // Wait for file to be processed
+            let file = uploadResult;
+            while (file.state === 'PROCESSING') {
+                await new Promise(resolve => setTimeout(resolve, 1000));
+                const fileStatus = await ai.files.get({ name: file.name! });
+                file = fileStatus;
+            }
+
+            if (file.state === 'FAILED') {
+                throw new Error('File processing failed on Google servers');
+            }
+
+            contents = [{
+                role: 'user',
+                parts: [
+                    { text: EXTRACTION_PROMPT },
+                    {
+                        fileData: {
+                            mimeType: file.mimeType || "application/pdf",
+                            fileUri: file.uri!
+                        }
+                    }
+                ],
+            }];
+        } else {
+            // SMALL FILE: Use inline base64 (faster for small files)
+            console.log('Using inline base64 for small PDF...');
+            const base64Data = pdfBuffer.toString('base64');
+
+            contents = [{
                 role: 'user',
                 parts: [
                     { text: EXTRACTION_PROMPT },
@@ -161,19 +215,21 @@ export async function extractWithGemini(pdfBuffer: Buffer): Promise<GeminiExtrac
                         }
                     }
                 ],
-            },
-        ];
+            }];
+        }
+
+        const model = 'gemini-2.5-flash-preview-05-20';
 
         // Enable HIGH thinking level for better analysis
         const config = {
             thinkingConfig: {
-                thinkingLevel: 'HIGH',
+                thinkingBudget: 10000,
             },
             responseMimeType: 'application/json',
             responseSchema: extractionSchema,
         };
 
-        console.log('Calling Gemini 3 Flash with HIGH thinking level...');
+        console.log('Calling Gemini with thinking budget...');
         const result = await ai.models.generateContent({
             model,
             contents,
@@ -222,5 +278,12 @@ export async function extractWithGemini(pdfBuffer: Buffer): Promise<GeminiExtrac
             success: false,
             error: error.message || "Unknown error during Gemini extraction"
         };
+    } finally {
+        // Cleanup temp file
+        try {
+            await unlink(tempFile);
+        } catch {
+            // Ignore cleanup errors
+        }
     }
 }
