@@ -121,7 +121,7 @@ export async function POST(request: NextRequest) {
             return null;
         };
 
-        // Map transactions to DB format
+        // Map transactions to DB format (matching actual database columns)
         const transactionsWithIds = processingResult.transactions.map((tx, index) => {
             const amount = tx.amount ?? 0;
             const isDebit = tx.type === 'debit' || amount < 0;
@@ -131,13 +131,16 @@ export async function POST(request: NextRequest) {
                 conversion_id: conversionId,
                 row_index: index,
                 date: parseValidDate(tx.date),
-                description: tx.description,
+                description: tx.description || '',
                 debit: isDebit ? absAmount : null,
                 credit: !isDebit ? absAmount : null,
                 balance: tx.balance,
-                confidence_score: typeof tx.confidence === 'number' ? tx.confidence * 100 : 0,
-                needs_review: (tx.confidence ?? 0) < 0.7,
-                ocr_text_raw: tx.rawText || tx.description,
+                confidence_score: typeof tx.confidence === 'number' ? tx.confidence * 100 : 85,
+                is_excluded: false,
+                is_header: false,
+                pdf_page: tx.bbox?.page || 1,
+                pdf_bbox: tx.bbox ? { x1: tx.bbox.x1, y1: tx.bbox.y1, x2: tx.bbox.x2, y2: tx.bbox.y2 } : null,
+                raw_text: tx.rawText || tx.description || '',
             };
         });
 
