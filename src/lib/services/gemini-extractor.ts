@@ -1,13 +1,10 @@
 /**
- * Gemini Extractor for Bank Statements
- * Uses Google AI File API for memory-safe large PDF handling
+ * Gemini 3 Flash Extractor for Bank Statements
+ * Uses @google/genai package with gemini-3-flash-preview model
  * Handles multi-account consolidated statements with advanced reasoning
- * 
- * IMPORTANT: Uses @google/generative-ai for File API (GoogleAIFileManager)
  */
 
-import { GoogleGenerativeAI } from '@google/generative-ai';
-import { GoogleAIFileManager } from '@google/generative-ai/server';
+import { GoogleGenAI } from '@google/genai';
 import { writeFile, unlink } from 'fs/promises';
 import { tmpdir } from 'os';
 import { join } from 'path';
@@ -58,14 +55,33 @@ const EXTRACTION_PROMPT = `You are analyzing a bank statement PDF. Extract ALL f
    - Foreign currency transactions
 
 ## Output Requirements
-Return a JSON object with:
-- bankName: string (detected bank name)
-- statementPeriod: { start: "YYYY-MM-DD", end: "YYYY-MM-DD" }
-- isMultiAccount: boolean
-- accounts: array of account objects with their own transactions
-- openingBalance: number (overall/primary)
-- closingBalance: number (overall/primary)
-- transactions: array of ALL transactions combined
+Return a JSON object with this exact structure:
+{
+  "bankName": "string or null",
+  "statementPeriod": { "start": "YYYY-MM-DD", "end": "YYYY-MM-DD" },
+  "isMultiAccount": boolean,
+  "accounts": [
+    {
+      "accountNumber": "string or null",
+      "accountType": "string or null",
+      "currency": "string or null",
+      "openingBalance": number or null,
+      "closingBalance": number or null,
+      "transactions": []
+    }
+  ],
+  "openingBalance": number or null,
+  "closingBalance": number or null,
+  "transactions": [
+    {
+      "date": "YYYY-MM-DD",
+      "description": "string",
+      "amount": number (absolute value),
+      "type": "debit" or "credit",
+      "balance": number or null
+    }
+  ]
+}
 
 Be thorough and precise. Missing transactions will cause reconciliation failures.`;
 
@@ -77,13 +93,12 @@ export async function extractWithGemini(pdfBuffer: Buffer): Promise<GeminiExtrac
     const tempFile = join(tmpdir(), `gemini-${randomUUID()}.pdf`);
 
     try {
+        // Initialize with @google/genai
+        const ai = new GoogleGenAI({ apiKey: GEMINI_API_KEY });
+
         // Check file size
         const fileSizeMB = pdfBuffer.length / (1024 * 1024);
         console.log(`PDF size: ${fileSizeMB.toFixed(2)} MB`);
-
-        // Initialize clients
-        const genAI = new GoogleGenerativeAI(GEMINI_API_KEY);
-        const model = genAI.getGenerativeModel({ model: 'gemini-2.0-flash' });
 
         let parts: any[];
 
@@ -94,41 +109,46 @@ export async function extractWithGemini(pdfBuffer: Buffer): Promise<GeminiExtrac
             // Write buffer to temp file
             await writeFile(tempFile, pdfBuffer);
 
-            // Initialize file manager
-            const fileManager = new GoogleAIFileManager(GEMINI_API_KEY);
-
-            // Upload file
-            const uploadResult = await fileManager.uploadFile(tempFile, {
-                mimeType: "application/pdf",
-                displayName: "Bank Statement",
+            // Upload file using @google/genai
+            const uploadResult = await ai.files.upload({
+                file: tempFile,
+                config: {
+                    mimeType: "application/pdf",
+                    displayName: "Bank Statement",
+                }
             });
 
-            console.log(`File uploaded: ${uploadResult.file.uri}`);
+            if (!uploadResult?.uri) {
+                throw new Error('File upload failed - no URI returned');
+            }
 
-            // Wait for file to be ready (ACTIVE state)
-            let file = await fileManager.getFile(uploadResult.file.name);
+            console.log(`File uploaded: ${uploadResult.uri}`);
+
+            // Wait for file to be ready
+            let file = uploadResult;
             while (file.state === 'PROCESSING') {
                 console.log('Waiting for file processing...');
                 await new Promise(resolve => setTimeout(resolve, 2000));
-                file = await fileManager.getFile(uploadResult.file.name);
+                const fileStatus = await ai.files.get({ name: file.name! });
+                file = fileStatus;
             }
 
             if (file.state === 'FAILED') {
                 throw new Error('File processing failed on Google servers');
             }
 
-            // Use file URI instead of inline data
+            // Use file URI
             parts = [
                 { text: EXTRACTION_PROMPT },
                 {
                     fileData: {
-                        mimeType: file.mimeType,
-                        fileUri: file.uri
+                        mimeType: file.mimeType || "application/pdf",
+                        fileUri: file.uri!
                     }
                 }
             ];
         } else {
-            // SMALL FILE: Use inline base64 (faster for small files)
+            // SMALL FILE: Use inline base64
             console.log('Using inline base64 for small PDF...');
             const base64Data = pdfBuffer.toString('base64');
 
@@ -143,19 +163,41 @@ export async function extractWithGemini(pdfBuffer: Buffer): Promise<GeminiExtrac
             ];
         }
 
-        console.log('Calling Gemini...');
-        const result = await model.generateContent({
-            contents: [{ role: 'user', parts }],
-            generationConfig: {
-                responseMimeType: 'application/json',
+        // Config with HIGH thinking level
+        const config = {
+            thinkingConfig: {
+                thinkingLevel: 'HIGH',
             },
+            responseMimeType: 'application/json',
+        };
+
+        // Use gemini-3-flash-preview model
+        const model = 'gemini-3-flash-preview';
+
+        console.log(`Calling ${model} with HIGH thinking level...`);
+
+        const result = await ai.models.generateContent({
+            model,
+            config,
+            contents: [{ role: 'user', parts }],
         });
 
-        const response = result.response;
-        const responseText = response.text();
+        // Get response text
+        let responseText: string | undefined;
+
+        if (result?.response?.text) {
+            responseText = typeof result.response.text === 'function'
+                ? result.response.text()
+                : result.response.text;
+        } else if (result?.text) {
+            responseText = typeof result.text === 'function' ? result.text() : result.text;
+        } else if (result?.candidates?.[0]?.content?.parts?.[0]?.text) {
+            responseText = result.candidates[0].content.parts[0].text;
+        }
 
         if (!responseText) {
-            throw new Error("Empty response from Gemini");
+            console.error('Gemini API Response:', JSON.stringify(result, null, 2));
+            throw new Error("Empty or unexpected response structure from Gemini");
         }
 
         const data = JSON.parse(responseText);
@@ -173,7 +215,7 @@ export async function extractWithGemini(pdfBuffer: Buffer): Promise<GeminiExtrac
         return {
             success: true,
             data,
-            usage: response.usageMetadata
+            usage: result?.response?.usageMetadata || result?.usageMetadata
         };
 
     } catch (error: any) {
@@ -187,7 +229,7 @@ export async function extractWithGemini(pdfBuffer: Buffer): Promise<GeminiExtrac
         try {
             await unlink(tempFile);
         } catch {
-            // Ignore cleanup errors - file may not exist if we used inline
+            // Ignore cleanup errors
         }
     }
 }
