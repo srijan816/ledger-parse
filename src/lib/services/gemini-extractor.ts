@@ -1,16 +1,11 @@
 /**
- * Gemini 3 Flash Extractor for Bank Statements
- * Uses @google/genai package with gemini-3-flash-preview model
+ * Gemini 3 Flash Extractor via OpenRouter
+ * Uses OpenRouter API to access google/gemini-3-flash-preview with reasoning enabled
  * Handles multi-account consolidated statements with advanced reasoning
  */
 
-import { GoogleGenAI } from '@google/genai';
-import { writeFile, unlink } from 'fs/promises';
-import { tmpdir } from 'os';
-import { join } from 'path';
-import { randomUUID } from 'crypto';
-
-const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
+const OPENROUTER_API_KEY = process.env.OPENROUTER_API_KEY;
+const OPENROUTER_URL = 'https://openrouter.ai/api/v1/chat/completions';
 
 interface GeminiExtractionResult {
     success: boolean;
@@ -55,7 +50,7 @@ const EXTRACTION_PROMPT = `You are analyzing a bank statement PDF. Extract ALL f
    - Foreign currency transactions
 
 ## Output Requirements
-Return a JSON object with this exact structure:
+Return ONLY a valid JSON object with this exact structure (no markdown, no code blocks):
 {
   "bankName": "string or null",
   "statementPeriod": { "start": "YYYY-MM-DD", "end": "YYYY-MM-DD" },
@@ -86,136 +81,91 @@ Return a JSON object with this exact structure:
 Be thorough and precise. Missing transactions will cause reconciliation failures.`;
 
 export async function extractWithGemini(pdfBuffer: Buffer): Promise<GeminiExtractionResult> {
-    if (!GEMINI_API_KEY) {
-        return { success: false, error: "Missing GEMINI_API_KEY" };
+    if (!OPENROUTER_API_KEY) {
+        return { success: false, error: "Missing OPENROUTER_API_KEY" };
     }
 
-    const tempFile = join(tmpdir(), `gemini-${randomUUID()}.pdf`);
-
     try {
-        // Initialize with @google/genai
-        const ai = new GoogleGenAI({ apiKey: GEMINI_API_KEY });
-
-        // Check file size
+        // Convert PDF to base64 for multimodal input
+        const base64Data = pdfBuffer.toString('base64');
         const fileSizeMB = pdfBuffer.length / (1024 * 1024);
         console.log(`PDF size: ${fileSizeMB.toFixed(2)} MB`);
 
-        let parts: any[];
-
-        if (fileSizeMB > 4) {
-            // LARGE FILE: Use File Manager to upload directly to Google
-            console.log('Using Google AI File Manager for large PDF...');
-
-            // Write buffer to temp file
-            await writeFile(tempFile, pdfBuffer);
-
-            // Upload file using @google/genai
-            const uploadResult = await ai.files.upload({
-                file: tempFile,
-                config: {
-                    mimeType: "application/pdf",
-                    displayName: "Bank Statement",
-                }
-            });
-
-            if (!uploadResult?.uri) {
-                throw new Error('File upload failed - no URI returned');
-            }
-
-            console.log(`File uploaded: ${uploadResult.uri}`);
-
-            // Wait for file to be ready
-            let file = uploadResult;
-            while (file.state === 'PROCESSING') {
-                console.log('Waiting for file processing...');
-                await new Promise(resolve => setTimeout(resolve, 2000));
-                const fileStatus = await ai.files.get({ name: file.name! });
-                file = fileStatus;
-            }
-
-            if (file.state === 'FAILED') {
-                throw new Error('File processing failed on Google servers');
-            }
-
-            // Use file URI
-            parts = [
-                { text: EXTRACTION_PROMPT },
-                {
-                    fileData: {
-                        mimeType: file.mimeType || "application/pdf",
-                        fileUri: file.uri!
+        // Create message with PDF as base64 image/file
+        const messages = [
+            {
+                role: 'user',
+                content: [
+                    {
+                        type: 'text',
+                        text: EXTRACTION_PROMPT
+                    },
+                    {
+                        type: 'file',
+                        file: {
+                            filename: 'bank_statement.pdf',
+                            file_data: `data:application/pdf;base64,${base64Data}`
+                        }
                     }
-                }
-            ];
-        } else {
-            // SMALL FILE: Use inline base64
-            console.log('Using inline base64 for small PDF...');
-            const base64Data = pdfBuffer.toString('base64');
+                ]
+            }
+        ];
 
-            parts = [
-                { text: EXTRACTION_PROMPT },
-                {
-                    inlineData: {
-                        mimeType: "application/pdf",
-                        data: base64Data
-                    }
-                }
-            ];
-        }
+        console.log('Calling Gemini 3 Flash via OpenRouter with reasoning enabled...');
 
-        // Config with HIGH thinking level
-        const config = {
-            thinkingConfig: {
-                thinkingLevel: 'HIGH',
+        const response = await fetch(OPENROUTER_URL, {
+            method: 'POST',
+            headers: {
+                'Authorization': `Bearer ${OPENROUTER_API_KEY}`,
+                'Content-Type': 'application/json',
+                'HTTP-Referer': process.env.NEXT_PUBLIC_APP_URL || 'http://localhost:3000',
+                'X-Title': 'LedgerParse Bank Statement Converter'
             },
-            responseMimeType: 'application/json',
-        };
-
-        // Use gemini-3-flash-preview model
-        const model = 'gemini-3-flash-preview';
-
-        console.log(`Calling ${model} with HIGH thinking level...`);
-
-        const result = await ai.models.generateContent({
-            model,
-            config,
-            contents: [{ role: 'user', parts }],
+            body: JSON.stringify({
+                model: 'google/gemini-3-flash-preview',
+                messages,
+                reasoning: { enabled: true },
+                temperature: 0.1, // Low temperature for consistent extraction
+                max_tokens: 16000,
+            })
         });
 
-        // Get response text
-        let responseText: string | undefined;
-
-        if (result?.response?.text) {
-            responseText = typeof result.response.text === 'function'
-                ? result.response.text()
-                : result.response.text;
-        } else if (result?.text) {
-            responseText = typeof result.text === 'function' ? result.text() : result.text;
-        } else if (result?.candidates?.[0]?.content?.parts?.[0]?.text) {
-            responseText = result.candidates[0].content.parts[0].text;
+        if (!response.ok) {
+            const errorData = await response.json().catch(() => ({}));
+            throw new Error(`OpenRouter API error ${response.status}: ${JSON.stringify(errorData)}`);
         }
 
-        if (!responseText) {
-            console.error('Gemini API Response:', JSON.stringify(result, null, 2));
-            throw new Error("Empty or unexpected response structure from Gemini");
+        const result = await response.json();
+
+        // Extract the response content
+        const assistantMessage = result.choices?.[0]?.message;
+        if (!assistantMessage?.content) {
+            throw new Error('No content in OpenRouter response');
         }
 
+        let responseText = assistantMessage.content;
+
+        // Clean up response - remove markdown code blocks if present
+        responseText = responseText.replace(/```json\n?/g, '').replace(/```\n?/g, '').trim();
+
+        // Parse JSON
         const data = JSON.parse(responseText);
 
         // Log summary for debugging
-        console.log('Gemini Extraction Summary:', {
+        console.log('Gemini 3 Flash Extraction Summary:', {
             bankName: data.bankName,
             isMultiAccount: data.isMultiAccount,
             accountCount: data.accounts?.length || 0,
             totalTransactions: data.transactions?.length || 0,
             openingBalance: data.openingBalance,
             closingBalance: data.closingBalance,
+            reasoningUsed: !!assistantMessage.reasoning_details,
         });
 
         return {
             success: true,
             data,
-            usage: result?.response?.usageMetadata || result?.usageMetadata
+            usage: result.usage
         };
 
     } catch (error: any) {
@@ -224,12 +174,5 @@ export async function extractWithGemini(pdfBuffer: Buffer): Promise<GeminiExtrac
             success: false,
             error: error.message || "Unknown error during Gemini extraction"
         };
-    } finally {
-        // Cleanup temp file
-        try {
-            await unlink(tempFile);
-        } catch {
-            // Ignore cleanup errors
-        }
     }
 }
