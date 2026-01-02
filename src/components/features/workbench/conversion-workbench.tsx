@@ -1,6 +1,6 @@
 'use client'
 
-import { useState } from 'react'
+import { useState, useEffect } from 'react'
 import { Transaction } from '@/types/transaction'
 import { DataGrid } from '@/components/features/workbench/data-grid'
 import { toast } from 'sonner'
@@ -12,6 +12,11 @@ interface ConversionWorkbenchProps {
 
 export function ConversionWorkbench({ conversionId, initialTransactions }: ConversionWorkbenchProps) {
     const [transactions, setTransactions] = useState(initialTransactions)
+
+    // Sync state when initialTransactions changes (e.g., after router.refresh())
+    useEffect(() => {
+        setTransactions(initialTransactions)
+    }, [initialTransactions])
 
     const handleCellEdit = async (transactionId: string, field: string, value: any) => {
         // Optimistic update
